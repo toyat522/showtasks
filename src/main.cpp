@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,7 @@ const char *magenta = "\033[35m";
 
 struct Task {
   std::string text;
+  std::string raw_text; // text with metadata still intact, used to rebuild the next occurrence
   std::string file;
   int line = 0;
   std::optional<std::string> due;
@@ -34,6 +36,20 @@ struct Task {
   std::optional<std::string> start;
   int priority = 3; // 6=highest .. 1=lowest, 3=none
   bool recurring = false;
+  std::optional<std::string> recurrence_rule; // e.g. "every 2 days when done"
+  std::optional<std::string> completion_flag; // "delete" or "keep", from 🏁
+};
+
+// A parsed "every N <unit>(s) [when done]" recurrence rule
+struct RecurrenceRule {
+  int interval;
+  char unit; // 'd', 'w', 'm', 'y'
+  bool when_done;
+};
+
+// Year, month, date
+struct Ymd {
+  int y, m, d;
 };
 
 // Get today's date
@@ -105,16 +121,16 @@ static int extract_priority(std::string &desc) {
   return 3;
 }
 
-// Return true if recurring and remove recurrence from input desc
-static bool extract_recurrence(std::string &desc) {
+// Extract recurrence rule text (e.g. "every 2 days when done") and remove it from desc
+static std::optional<std::string> extract_recurrence(std::string &desc) {
   // Find recurrence emoji in desc
   const std::string emoji = "\xf0\x9f\x94\x81"; // 🔁
   size_t pos = desc.find(emoji);
   if (pos == std::string::npos) {
-    return false;
+    return std::nullopt;
   }
 
-  // Erase string between recurrence emoji and stop marker inclusive
+  // The rule text runs from the emoji to the next stop marker (or end of string)
   static const std::vector<std::string> stop_markers = {
     "\xf0\x9f\x93\x85", // 📅
     "\xe2\x8f\xb3",     // ⏳
@@ -132,13 +148,22 @@ static bool extract_recurrence(std::string &desc) {
       end = p;
     }
   }
+
+  size_t rule_start = pos + emoji.length();
+  std::string rule = desc.substr(rule_start, end - rule_start);
   desc.erase(pos, end - pos);
 
-  return true;
+  // Trim leftover leading/trailing spaces from the emoji/stop-marker boundaries
+  size_t a = rule.find_first_not_of(' ');
+  if (a == std::string::npos) {
+    return std::nullopt;
+  }
+  size_t b = rule.find_last_not_of(' ');
+  return rule.substr(a, b - a + 1);
 }
 
-// Erases emoji and the word after the emoji
-static void skip_word_after(std::string &desc, size_t marker_pos, size_t marker_len) {
+// Erases emoji and the word after the emoji, returning that word
+static std::string skip_word_after(std::string &desc, size_t marker_pos, size_t marker_len) {
   std::string rest = desc.substr(marker_pos + marker_len);
   size_t i = 0;
   while (i < rest.size() && rest[i] == ' ') {
@@ -148,19 +173,22 @@ static void skip_word_after(std::string &desc, size_t marker_pos, size_t marker_
   while (j < rest.size() && rest[j] != ' ') {
     j++;
   }
+  std::string word = rest.substr(i, j - i);
   while (j < rest.size() && rest[j] == ' ') {
     j++;
   }
   desc.erase(marker_pos, marker_len + j);
+  return word;
 }
 
-// Strip delete/keep flag
-static void strip_flag(std::string &desc) {
+// Extract and strip the "delete"/"keep" on-completion flag
+static std::optional<std::string> extract_flag(std::string &desc) {
   const std::string completion = "\xf0\x9f\x8f\x81"; // 🏁
   size_t pos = desc.find(completion);
-  if (pos != std::string::npos) {
-    skip_word_after(desc, pos, completion.length());
+  if (pos == std::string::npos) {
+    return std::nullopt;
   }
+  return skip_word_after(desc, pos, completion.length());
 }
 
 // Collapse runs of 2+ spaces down to a single space
@@ -228,12 +256,14 @@ static std::vector<Task> collect_tasks(const fs::path &vault) {
     task.file = m[1].str();
     task.line = std::stoi(m[2].str());
     std::string desc = m[3].str();
+    task.raw_text = desc; // preserved with metadata intact, for rebuilding the next occurrence
     task.due = extract_date(desc, "\xf0\x9f\x93\x85");   // 📅
     task.scheduled = extract_date(desc, "\xe2\x8f\xb3"); // ⏳
     task.start = extract_date(desc, "\xf0\x9f\x9b\xab"); // 🛫
     task.priority = extract_priority(desc);
-    task.recurring = extract_recurrence(desc);
-    strip_flag(desc);
+    task.recurrence_rule = extract_recurrence(desc);
+    task.recurring = task.recurrence_rule.has_value();
+    task.completion_flag = extract_flag(desc);
     collapse_spaces(desc);
     task.text = trim(desc);
 
@@ -310,7 +340,148 @@ static void print_task(int i, const Task &t, const std::string &today) {
   std::cout << out.str() << "\n";
 }
 
-// Flip the task's checkbox to [x] and append a done date, in place in its file
+static Ymd parse_ymd(const std::string &s) {
+  return Ymd{std::stoi(s.substr(0, 4)), std::stoi(s.substr(5, 2)), std::stoi(s.substr(8, 2))};
+}
+
+static std::string format_ymd(const Ymd &d) {
+  char buf[11];
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", d.y, d.m, d.d);
+  return buf;
+}
+
+static bool is_leap_year(int y) {
+  return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+}
+
+static int days_in_month(int y, int m) {
+  static const int dim[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (m == 2 && is_leap_year(y)) {
+    return 29;
+  }
+  return dim[m - 1];
+}
+
+static Ymd add_days(Ymd d, int n) {
+  std::tm tm{};
+  tm.tm_year = d.y - 1900;
+  tm.tm_mon = d.m - 1;
+  tm.tm_mday = d.d + n;
+  tm.tm_hour = 12;
+  std::mktime(&tm);
+  return Ymd{tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday};
+}
+
+static Ymd add_months(Ymd d, int n) {
+  int total = d.y * 12 + (d.m - 1) + n;
+  int ny = total / 12;
+  int nm = total % 12;
+  if (nm < 0) {
+    nm += 12;
+    ny -= 1;
+  }
+  int nd = std::min(d.d, days_in_month(ny, nm + 1));
+  return Ymd{ny, nm + 1, nd};
+}
+
+// Parses rule text like "every 2 days when done". Returns nullopt if the
+// rule doesn't match this simple grammar (Tasks plugin supports a richer
+// syntax, e.g. "every week on Monday", which isn't handled here).
+static std::optional<RecurrenceRule> parse_recurrence(const std::string &rule_text) {
+  static const std::regex re(
+    R"(^every\s+(?:(\d+)\s+)?(day|week|month|year)s?(\s+when\s+done)?$)",
+    std::regex::icase
+  );
+  std::smatch m;
+  if (!std::regex_match(rule_text, m, re)) {
+    return std::nullopt;
+  }
+
+  RecurrenceRule r;
+  r.interval = m[1].matched ? std::stoi(m[1].str()) : 1;
+  std::string unit = m[2].str();
+  for (auto &c : unit) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  if (unit == "day") {
+    r.unit = 'd';
+  } else if (unit == "week") {
+    r.unit = 'w';
+  } else if (unit == "month") {
+    r.unit = 'm';
+  } else {
+    r.unit = 'y';
+  }
+  r.when_done = m[3].matched;
+  return r;
+}
+
+// Applies a recurrence rule to a "YYYY-MM-DD" date, returning the next date
+static std::string apply_recurrence(const std::string &base_date, const RecurrenceRule &rule) {
+  Ymd base = parse_ymd(base_date);
+  switch (rule.unit) {
+    case 'd':
+      return format_ymd(add_days(base, rule.interval));
+    case 'w':
+      return format_ymd(add_days(base, rule.interval * 7));
+    case 'm':
+      return format_ymd(add_months(base, rule.interval));
+    default:
+      return format_ymd(add_months(base, rule.interval * 12));
+  }
+}
+
+// Replaces the YYYY-MM-DD immediately following the given emoji marker
+// within text with new_date. No-op if the emoji or a following date isn't found.
+static void replace_date_after_emoji(std::string &text, const std::string &emoji, const std::string &new_date) {
+  static const std::regex date_re(R"(\d{4}-\d{2}-\d{2})");
+  size_t pos = text.find(emoji);
+  if (pos == std::string::npos) {
+    return;
+  }
+  std::string rest = text.substr(pos + emoji.length());
+  std::smatch m;
+  if (std::regex_search(rest, m, date_re)) {
+    text.replace(pos + emoji.length() + m.position(0), m.length(0), new_date);
+  }
+}
+
+// Builds the "- [ ] ..." line for the task's next occurrence.
+// Returns nullopt if the task doesn't recur or its rule can't be parsed.
+static std::optional<std::string> build_next_occurrence_line(
+    const std::string &original_line, const Task &t, const std::string &today) {
+  if (!t.recurring || !t.recurrence_rule) {
+    return std::nullopt;
+  }
+  auto rule = parse_recurrence(*t.recurrence_rule);
+  if (!rule) {
+    std::cerr << "Warning: could not parse recurrence rule \"" << *t.recurrence_rule
+              << "\"; not creating next occurrence\n";
+    return std::nullopt;
+  }
+
+  // Apply recurrence rule from the base date
+  std::string base_date = rule->when_done ? today : (t.scheduled ? *t.scheduled : today);
+  std::string next_date = apply_recurrence(base_date, *rule);
+
+  // Set new text with new date
+  std::string new_text = t.raw_text;
+  replace_date_after_emoji(new_text, "\xe2\x8f\xb3", next_date); // ⏳
+
+  // Match original indentation level
+  std::string indent;
+  for (char c : original_line) {
+    if (c == ' ' || c == '\t') {
+      indent += c;
+    } else {
+      break;
+    }
+  }
+  return indent + "- [ ] " + new_text;
+}
+
+// Marks the task done. If it recurs, the next occurrence is inserted.
+// If its 🏁 flag is "delete," the completed line is replaced rather than kept.
 static bool mark_task_done(const fs::path &vault, const Task &t, const std::string &today) {
   fs::path file_path = vault / t.file;
   std::ifstream in(file_path);
@@ -327,11 +498,32 @@ static bool mark_task_done(const fs::path &vault, const Task &t, const std::stri
   }
   in.close();
 
-  // Replace unchecked box with checked box
+  // Create next line if it is a recurring task
   int idx = t.line - 1;
+  auto next_line = build_next_occurrence_line(lines[idx], t, today);
+  bool delete_on_complete = t.completion_flag && *t.completion_flag == "delete";
+
+  if (next_line && delete_on_complete) {
+    // No checked copy is kept, so the line is replaced by the next occurrence
+    lines[idx] = *next_line;
+    std::ofstream out(file_path, std::ios::trunc);
+    for (auto &l : lines) {
+      out << l << "\n";
+    }
+    return true;
+  }
+
+  if (next_line) {
+    // Insert the next occurrence above the completed line
+    lines.insert(lines.begin() + idx, *next_line);
+    idx += 1;
+  }
+
+  // Replace unchecked box with checked box and add done date
   std::string &target = lines[idx];
   size_t box = target.find("[ ]");
   target.replace(box, 3, "[x]");
+  target += " \xe2\x9c\x85 " + today; // ✅ done date
 
   // Rewrite file
   std::ofstream out(file_path, std::ios::trunc);
