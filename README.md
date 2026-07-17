@@ -13,6 +13,10 @@ scheduled on or before today
 
 in Obsidian.
 
+# Dependencies
+- [lolcat](https://github.com/busyloop/lolcat)
+- [ripgrep](https://github.com/burntsushi/ripgrep)
+
 # Build
 ```
 mkdir build

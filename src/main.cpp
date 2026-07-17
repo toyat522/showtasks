@@ -564,6 +564,12 @@ int main(int argc, char **argv) {
   }
 
   // `showtasks`: print tasks
+  if (tasks.empty()) {
+    int rc = std::system("echo '\xe2\xb8\x9c( \xc2\xb4 \xea\x92\xb3 ` )\xe2\xb8\x9d yay all tasks are completed "
+                         "\xe2\xb8\x9c( \xc2\xb4 \xea\x92\xb3 ` )\xe2\xb8\x9d' | lolcat -F 0.5 -p 6 -S 8");
+    return 0;
+  }
+
   int i = 0;
   for (const auto &t : tasks) {
     print_task(i, t, today);
