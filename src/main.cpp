@@ -5,6 +5,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <regex>
@@ -277,7 +278,7 @@ static void sort_tasks(std::vector<Task> &tasks) {
 }
 
 // Print given task with appropriate color and date
-static void print_task(const Task &t, const std::string &today) {
+static void print_task(int i, const Task &t, const std::string &today) {
   std::ostringstream out;
 
   // Print text with color based on priority
@@ -288,7 +289,7 @@ static void print_task(const Task &t, const std::string &today) {
   } else if (t.priority == 2 || t.priority == 1) {
     out << color::dim;
   }
-  out << t.text << color::reset;
+  out << i << ": " << t.text << color::reset;
 
   // Print date with color based on scheduled date
   const char *c = "";
@@ -309,6 +310,37 @@ static void print_task(const Task &t, const std::string &today) {
   std::cout << out.str() << "\n";
 }
 
+// Flip the task's checkbox to [x] and append a done date, in place in its file
+static bool mark_task_done(const fs::path &vault, const Task &t, const std::string &today) {
+  fs::path file_path = vault / t.file;
+  std::ifstream in(file_path);
+  if (!in) {
+    std::cerr << "Failed to open file: " << file_path << "\n";
+    return false;
+  }
+
+  // Append lines to vector
+  std::vector<std::string> lines;
+  std::string line;
+  while (std::getline(in, line)) {
+    lines.push_back(line);
+  }
+  in.close();
+
+  // Replace unchecked box with checked box
+  int idx = t.line - 1;
+  std::string &target = lines[idx];
+  size_t box = target.find("[ ]");
+  target.replace(box, 3, "[x]");
+
+  // Rewrite file
+  std::ofstream out(file_path, std::ios::trunc);
+  for (auto &l : lines) {
+    out << l << "\n";
+  }
+  return true;
+}
+
 int main(int argc, char **argv) {
   const char *home = std::getenv("HOME");
   fs::path vault = fs::path(home ? home : "") / "docs" / "obsidian" / "Main";
@@ -320,14 +352,30 @@ int main(int argc, char **argv) {
 
   std::vector<Task> tasks = collect_tasks(vault);
 
-  // Filter away tasks not yet scheduled
+  // Filter away tasks not yet scheduled and sort tasks
   std::string today = get_today_date();
   filter_not_scheduled(tasks, today);
-
-  // Sort and print tasks
   sort_tasks(tasks);
+
+  // `showtasks done <task_number>`
+  if (argc >= 3 && std::string(argv[1]) == "done") {
+    int n = std::stoi(argv[2]);
+    if (n < 0 || n >= static_cast<int>(tasks.size())) {
+      std::cerr << "No task numbered " << n << "\n";
+      return 1;
+    }
+    if (!mark_task_done(vault, tasks[n], today)) {
+      return 1;
+    }
+    std::cout << "Marked done: " << tasks[n].text << "\n";
+    return 0;
+  }
+
+  // `showtasks`: print tasks
+  int i = 0;
   for (const auto &t : tasks) {
-    print_task(t, today);
+    print_task(i, t, today);
+    i++;
   }
 
   return 0;
